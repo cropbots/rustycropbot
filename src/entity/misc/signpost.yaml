@@ -1,0 +1,22 @@
+id: signpost
+name: Signpost
+kind: misc
+traits:
+  - species_goblin
+stats:
+  hp: 999
+visuals:
+  sprite: "src/assets/objects/player02.png"
+  draw_params:
+    dest_size: [32, 32]
+    rotation: 0.0
+    flip_x: false
+    flip_y: false
+    pivot: [16, 16]
+    color: [255, 255, 255, 255]
+    offset: [-16, -16]
+hitbox:
+  x: -8
+  y: -8
+  w: 16
+  h: 16

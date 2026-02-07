@@ -3,6 +3,8 @@ use macroquad::prelude::*;
 mod map;
 mod player;
 mod helpers;
+mod entity;
+mod r#trait;
 
 use map::{TileMap, TileSet};
 use player::Player;

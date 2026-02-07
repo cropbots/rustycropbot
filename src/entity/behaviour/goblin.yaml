@@ -1,0 +1,19 @@
+id: goblin_core
+behavior:
+  type: selector
+  children:
+    - type: sequence
+      children:
+        - type: condition
+          name: hp_below
+          value: 0.2
+        - type: action
+          name: flee
+    - type: sequence
+      children:
+        - type: condition
+          name: player_visible
+        - type: action
+          name: attack_player
+    - type: action
+      name: wander

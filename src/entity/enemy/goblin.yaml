@@ -1,0 +1,39 @@
+id: virat
+traits:
+  - hostile
+stats:
+  hp: 30
+  speed: 4.5
+visuals:
+  sprite: "src/assets/objects/virat.png"
+  draw_params:
+    dest_size: [32, 32]
+    rotation: 0.0
+    flip_x: false
+    flip_y: false
+    pivot: [16, 16]
+    color: [255, 255, 255, 255]
+    offset: [-16, -16]
+hitbox:
+  x: -6
+  y: -6
+  w: 12
+  h: 10
+behavior:
+  type: selector
+  children:
+    - type: sequence
+      children:
+        - type: condition
+          name: hp_below
+          value: 0.2
+        - type: action
+          name: flee
+    - type: sequence
+      children:
+        - type: condition
+          name: player_visible
+        - type: action
+          name: attack_player
+    - type: action
+      name: wander

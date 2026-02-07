@@ -3,23 +3,19 @@ use macroquad::prelude::*;
 const EMPTY_TILE: u16 = u16::MAX;
 const CHUNK_SIZE: usize = 16;
 
-struct GridIndex {
-    x: i32,
-    y: i32,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridIndex {
+    pub x: i32,
+    pub y: i32,
 }
 
 impl GridIndex {
-    fn new(position: Vec2, grid_size: Vec2) -> Self {
+    pub fn new(position: Vec2, grid_size: Vec2) -> Self {
         Self {
             x: (position.x / grid_size.x).floor() as i32,
             y: (position.y / grid_size.y).floor() as i32,
         }
     }
-}
-
-pub struct Tile {
-    position: Vec2,
-    size: Vec2,
 }
 
 pub struct TileSet {
@@ -142,15 +138,19 @@ pub struct TileMap {
     background: Vec<u16>,
     foreground: Vec<u16>,
     overlay: Vec<u16>,
+    solid: Vec<bool>,
+    collision_blocks: Vec<Rect>,
+    collision_dirty: bool,
     chunk_cols: usize,
     chunk_rows: usize,
     chunk_pixel_size: f32,
     chunks: Vec<Chunk>,
+    grid_size: Vec2,
 }
 
 impl TileMap {
     pub fn demo(width: usize, height: usize, tile_size: f32, tile_count: usize) -> Self {
-        let mut map = Self::new(width, height, tile_size);
+        let mut map = Self::new(width, height, tile_size, Vec2::new(tile_size, tile_size));
 
         if tile_count > 0 {
             map.fill_layer(LayerKind::Background, 24);
@@ -159,7 +159,7 @@ impl TileMap {
         map
     }
 
-    pub fn new(width: usize, height: usize, tile_size: f32) -> Self {
+    pub fn new(width: usize, height: usize, tile_size: f32, grid_size: Vec2) -> Self {
         let len = width * height;
         let chunk_cols = (width + CHUNK_SIZE - 1) / CHUNK_SIZE;
         let chunk_rows = (height + CHUNK_SIZE - 1) / CHUNK_SIZE;
@@ -190,10 +190,14 @@ impl TileMap {
             background: vec![EMPTY_TILE; len],
             foreground: vec![EMPTY_TILE; len],
             overlay: vec![EMPTY_TILE; len],
+            solid: vec![false; len],
+            collision_blocks: Vec::new(),
+            collision_dirty: true,
             chunk_cols,
             chunk_rows,
             chunk_pixel_size,
             chunks,
+            grid_size,
         }
     }
 
@@ -305,6 +309,96 @@ impl TileMap {
             LayerKind::Overlay => self.overlay[i] = id,
         }
         self.mark_chunk_dirty(x, y, layer);
+    }
+
+    pub fn set_collision(&mut self, x: usize, y: usize, solid: bool) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let i = self.idx(x, y);
+        if self.solid[i] != solid {
+            self.solid[i] = solid;
+            self.collision_dirty = true;
+        }
+    }
+
+    pub fn fill_collision(&mut self, solid: bool) {
+        self.solid.fill(solid);
+        self.collision_dirty = true;
+    }
+
+    pub fn is_solid(&self, x: usize, y: usize) -> bool {
+        if x >= self.width || y >= self.height {
+            return false;
+        }
+        self.solid[self.idx(x, y)]
+    }
+
+    pub fn set_collision_from_layer(&mut self, layer: LayerKind, solid_ids: &[u16]) {
+        let mut max_id = 0u16;
+        for &id in solid_ids {
+            if id > max_id {
+                max_id = id;
+            }
+        }
+        let mut lookup = vec![false; max_id as usize + 1];
+        for &id in solid_ids {
+            if (id as usize) < lookup.len() {
+                lookup[id as usize] = true;
+            }
+        }
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let tile = self.get_tile(layer, x, y);
+                let solid = tile != EMPTY_TILE
+                    && (tile as usize) < lookup.len()
+                    && lookup[tile as usize];
+                let idx = self.idx(x, y);
+                self.solid[idx] = solid;
+            }
+        }
+
+        self.collision_dirty = true;
+    }
+
+    pub fn tile_at(&self, layer: LayerKind, x: usize, y: usize) -> u16 {
+        self.get_tile(layer, x, y)
+    }
+
+    pub fn collision_blocks(&mut self) -> &[Rect] {
+        if self.collision_dirty {
+            self.rebuild_collision_blocks();
+        }
+        &self.collision_blocks
+    }
+
+    pub fn grid_index(&self, position: Vec2) -> Option<GridIndex> {
+        let idx = GridIndex::new(position, self.grid_size);
+        if idx.x < 0 || idx.y < 0 {
+            return None;
+        }
+        let (x, y) = (idx.x as usize, idx.y as usize);
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        Some(idx)
+    }
+
+    pub fn grid_to_world(&self, grid: GridIndex) -> Vec2 {
+        vec2(
+            grid.x as f32 * self.grid_size.x,
+            grid.y as f32 * self.grid_size.y,
+        )
+    }
+
+    pub fn tile_bounds(&self, x: usize, y: usize) -> Rect {
+        Rect::new(
+            x as f32 * self.tile_size,
+            y as f32 * self.tile_size,
+            self.tile_size,
+            self.tile_size,
+        )
     }
 
     fn draw_visible_layer(
@@ -471,54 +565,82 @@ impl TileMap {
         }
     }
 
-    fn get_hitboxes_around_entity(&self, entity_grid_index: GridIndex) -> Vec<Rect> {
-        let grid_size = self.grid_size;
-        let start_x = entity_grid_index.x - 2;
-        let start_y = entity_grid_index.y - 2;
-        let end_x = entity_grid_index.x + 2;
-        let end_y = entity_grid_index.y + 2;
-        let mut hitboxes = Vec::new();
+    fn rebuild_collision_blocks(&mut self) {
+        self.collision_blocks.clear();
+        let mut visited = vec![false; self.solid.len()];
 
-        for x in start_x..=end_x {
-            for y in start_y..=end_y {
-                if let Some(chunk) = self.get_chunk_at_grid_index((x, y)) {
-                    if let Some(tile) = chunk.get_tile_at_grid_index((x, y)) {
-                        hitboxes.push(tile.get_hitbox());
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let i = self.idx(x, y);
+                if visited[i] || !self.solid[i] {
+                    continue;
+                }
+
+                let mut max_w = 0;
+                while x + max_w < self.width {
+                    let idx = self.idx(x + max_w, y);
+                    if self.solid[idx] && !visited[idx] {
+                        max_w += 1;
+                    } else {
+                        break;
                     }
+                }
+
+                let mut max_h = 1;
+                'height: loop {
+                    if y + max_h >= self.height {
+                        break;
+                    }
+                    for tx in 0..max_w {
+                        let idx = self.idx(x + tx, y + max_h);
+                        if !self.solid[idx] || visited[idx] {
+                            break 'height;
+                        }
+                    }
+                    max_h += 1;
+                }
+
+                for dy in 0..max_h {
+                    for dx in 0..max_w {
+                        visited[self.idx(x + dx, y + dy)] = true;
+                    }
+                }
+
+                self.collision_blocks.push(Rect::new(
+                    x as f32 * self.tile_size,
+                    y as f32 * self.tile_size,
+                    max_w as f32 * self.tile_size,
+                    max_h as f32 * self.tile_size,
+                ));
+            }
+        }
+
+        self.collision_dirty = false;
+    }
+
+    pub fn hitboxes_around_grid(&self, grid: GridIndex, radius: i32) -> Vec<Rect> {
+        let mut hitboxes = Vec::new();
+        let start_x = grid.x - radius;
+        let end_x = grid.x + radius;
+        let start_y = grid.y - radius;
+        let end_y = grid.y + radius;
+
+        for y in start_y..=end_y {
+            for x in start_x..=end_x {
+                if x < 0 || y < 0 {
+                    continue;
+                }
+                let (ux, uy) = (x as usize, y as usize);
+                if ux >= self.width || uy >= self.height {
+                    continue;
+                }
+                if self.is_solid(ux, uy) {
+                    hitboxes.push(self.tile_bounds(ux, uy));
                 }
             }
         }
 
         hitboxes
-    }
-
-    fn get_chunk_at_grid_index(&self, grid_index: (i32, i32)) -> Option<&Chunk> {
-        let chunk_cols = self.chunks.len() as i32;
-        let chunk_rows = self.chunks[0].tiles.len() as i32;
-        let chunk_x = grid_index.0 / self.grid_size.x;
-        let chunk_y = grid_index.1 / self.grid_size.y;
-        if chunk_x < chunk_cols && chunk_y < chunk_rows {
-            let chunk_index = (chunk_y * chunk_cols + chunk_x) as usize;
-            if chunk_index < self.chunks.len() {
-                Some(&self.chunks[chunk_index])
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
-
-    fn get_tile_at_grid_index(&self, grid_index: (i32, i32)) -> Option<&Tile> {
-        if let Some(chunk) = self.get_chunk_at_grid_index(grid_index) {
-            if let Some(tile) = chunk.get_tile_at_grid_index(grid_index) {
-                Some(tile)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
     }
 
     fn mark_chunk_dirty(&mut self, x: usize, y: usize, layer: LayerKind) {
