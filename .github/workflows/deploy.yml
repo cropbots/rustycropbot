@@ -3,7 +3,7 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches:
-      - main
+      - master
 
 jobs:
   deploy:
@@ -26,12 +26,13 @@ jobs:
       run: |
         cargo build --release --target wasm32-unknown-unknown
         cp target/wasm32-unknown-unknown/release/rustycropbot.wasm web/
-
-        cp -r assets web/
-        cp -r src/entity web/
-        cp -r src/particle web/
-        cp -r src/sound web/
-        cp -r src/structure web/
+        rm -rf web/assets web/entity web/particle web/sound web/structure
+        mkdir -p web/assets
+        cp -r src/assets/* web/assets/
+        cp -r src/entity web/assets/
+        cp -r src/particle web/assets/
+        cp -r src/sound web/assets/
+        cp -r src/structure web/assets/
 
     - name: Setup Pages
       uses: actions/configure-pages@v5
