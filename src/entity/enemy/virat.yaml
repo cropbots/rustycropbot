@@ -1,9 +1,11 @@
 id: virat
 traits:
-  - hostile
+  - target_player
+  - no_map_collision
 stats:
   hp: 30
   speed: 4.5
+  damage: 1
 visuals:
   sprite: "src/assets/objects/virat.png"
   draw_params:
@@ -14,10 +16,10 @@ visuals:
     flip_y: false
     pivot: [16, 16]
     color: [255, 255, 255, 255]
-    offset: [-16, -16]
+    offset: [0, 0]
 hitbox:
-  x: 0
-  y: 0
+  x: 16
+  y: 16
   w: 17.3
   h: 11.3
 behavior:
@@ -26,15 +28,9 @@ behavior:
     - type: sequence
       children:
         - type: condition
-          name: hp_below
-          value: 0.2
+          name: target_in_range
+          value: 0.5 # the viewport is 1.0 in width and height
         - type: action
-          name: flee
-    - type: sequence
-      children:
-        - type: condition
-          name: player_visible
-        - type: action
-          name: attack_player
+          name: dash_at_target
     - type: action
       name: wander

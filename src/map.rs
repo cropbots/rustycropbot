@@ -265,6 +265,196 @@ struct Chunk {
     dirty_overlay: bool,
 }
 
+struct StructureApplyState {
+    defs: Vec<StructureDef>,
+    seed: u32,
+    occupied: Vec<bool>,
+    placed_rects: Vec<Rect>,
+    spatial: Vec<Vec<usize>>,
+    cell_size: f32,
+    cell_cols: usize,
+    cell_rows: usize,
+    def_index: usize,
+    attempt_index: usize,
+    target: usize,
+    attempts: usize,
+    max_x: usize,
+    max_y: usize,
+    count: usize,
+    done: bool,
+}
+
+impl StructureApplyState {
+    fn new(map: &TileMap, defs: Vec<StructureDef>, seed: u32) -> Self {
+        let world_w = map.width as f32 * map.tile_size;
+        let world_h = map.height as f32 * map.tile_size;
+        let cell_size = map.chunk_pixel_size.max(map.tile_size);
+        let cell_cols = ((world_w / cell_size).ceil() as usize).max(1);
+        let cell_rows = ((world_h / cell_size).ceil() as usize).max(1);
+        let spatial = vec![Vec::new(); cell_cols * cell_rows];
+
+        let mut state = Self {
+            defs,
+            seed,
+            occupied: vec![false; map.width * map.height],
+            placed_rects: Vec::new(),
+            spatial,
+            cell_size,
+            cell_cols,
+            cell_rows,
+            def_index: 0,
+            attempt_index: 0,
+            target: 0,
+            attempts: 0,
+            max_x: 0,
+            max_y: 0,
+            count: 0,
+            done: false,
+        };
+        state.advance_def(map);
+        state
+    }
+
+    fn progress(&self) -> f32 {
+        if self.defs.is_empty() {
+            return 1.0;
+        }
+        let total_defs = self.defs.len().max(1) as f32;
+        let base = (self.def_index.min(self.defs.len())) as f32 / total_defs;
+        let step = if self.attempts > 0 {
+            (self.attempt_index.min(self.attempts)) as f32 / self.attempts as f32 / total_defs
+        } else {
+            0.0
+        };
+        (base + step).clamp(0.0, 1.0)
+    }
+
+    fn step(&mut self, map: &mut TileMap, time_budget_s: f32) -> bool {
+        if self.done {
+            return true;
+        }
+        let budget = time_budget_s.max(0.0001) as f64;
+        let start = get_time();
+
+        while (get_time() - start) < budget {
+            if self.done {
+                return true;
+            }
+            if self.attempt_index >= self.attempts || self.count >= self.target {
+                self.def_index += 1;
+                self.advance_def(map);
+                continue;
+            }
+
+            let def = &self.defs[self.def_index];
+            let i = self.attempt_index;
+            self.attempt_index += 1;
+
+            let rx = hash_u32(i as u32, self.seed ^ (self.def_index as u32 * 2654435761), 31);
+            let ry = hash_u32(i as u32, self.seed ^ (self.def_index as u32 * 2246822519), 47);
+            let x = (rx as usize % (self.max_x + 1)).min(self.max_x);
+            let y = (ry as usize % (self.max_y + 1)).min(self.max_y);
+
+            let pos = vec2(x as f32 * map.tile_size, y as f32 * map.tile_size);
+            let size = vec2(
+                def.structure.width as f32 * map.tile_size,
+                def.structure.height as f32 * map.tile_size,
+            );
+            let rect = Rect::new(pos.x, pos.y, size.x, size.y);
+            let padded = if def.min_distance > 0.0 {
+                Rect::new(
+                    rect.x - def.min_distance,
+                    rect.y - def.min_distance,
+                    rect.w + def.min_distance * 2.0,
+                    rect.h + def.min_distance * 2.0,
+                )
+            } else {
+                rect
+            };
+
+            if spatial_overlaps(
+                &padded,
+                &self.placed_rects,
+                &self.spatial,
+                self.cell_size,
+                self.cell_cols,
+                self.cell_rows,
+            ) {
+                continue;
+            }
+
+            let mut blocked = false;
+            for &(sx, sy) in def.structure.occupied_offsets.iter() {
+                let idx = map.idx(x + sx, y + sy);
+                if self.occupied[idx] {
+                    blocked = true;
+                    break;
+                }
+            }
+            if blocked {
+                continue;
+            }
+
+            map.place_structure_unchecked(&def.structure, x, y);
+            for &(sx, sy) in def.structure.occupied_offsets.iter() {
+                let idx = map.idx(x + sx, y + sy);
+                self.occupied[idx] = true;
+            }
+
+            self.placed_rects.push(padded);
+            let rect_index = self.placed_rects.len() - 1;
+            spatial_insert(
+                rect_index,
+                &padded,
+                &mut self.spatial,
+                self.cell_size,
+                self.cell_cols,
+                self.cell_rows,
+            );
+
+            self.count += 1;
+        }
+
+        self.done
+    }
+
+    fn advance_def(&mut self, map: &TileMap) {
+        while self.def_index < self.defs.len() {
+            let def = &self.defs[self.def_index];
+            let freq = def.frequency.clamp(0.0, 1.0);
+            if freq <= 0.0 || def.max_per_map == 0 || def.structure.is_empty() {
+                self.def_index += 1;
+                continue;
+            }
+            if def.structure.width == 0
+                || def.structure.height == 0
+                || map.width < def.structure.width
+                || map.height < def.structure.height
+            {
+                self.def_index += 1;
+                continue;
+            }
+
+            let area = (map.width * map.height) as f32;
+            let target = ((area * freq).round() as usize).min(def.max_per_map);
+            if target == 0 {
+                self.def_index += 1;
+                continue;
+            }
+
+            self.target = target;
+            self.attempts = (target * 12).max(24);
+            self.max_x = map.width - def.structure.width;
+            self.max_y = map.height - def.structure.height;
+            self.attempt_index = 0;
+            self.count = 0;
+            return;
+        }
+
+        self.done = true;
+    }
+}
+
 pub struct TileMap {
     width: usize,
     height: usize,
@@ -279,6 +469,7 @@ pub struct TileMap {
     chunk_rows: usize,
     chunk_pixel_size: f32,
     chunks: Vec<Chunk>,
+    structure_apply: Option<StructureApplyState>,
     grid_size: Vec2,
     border_thickness: f32,
 }
@@ -332,9 +523,93 @@ impl TileMap {
             chunk_rows,
             chunk_pixel_size,
             chunks,
+            structure_apply: None,
             grid_size,
             border_thickness,
         }
+    }
+
+    pub fn new_deferred(width: usize, height: usize, tile_size: f32, grid_size: Vec2, border_thickness: f32) -> Self {
+        let len = width * height;
+        let chunk_cols = (width + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let chunk_rows = (height + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let chunk_pixel_size = tile_size * CHUNK_SIZE as f32;
+        let total_chunks = chunk_cols * chunk_rows;
+
+        Self {
+            width,
+            height,
+            tile_size,
+            background: vec![EMPTY_TILE; len],
+            foreground: vec![EMPTY_TILE; len],
+            overlay: vec![EMPTY_TILE; len],
+            solid: vec![false; len],
+            collision_blocks: Vec::new(),
+            collision_dirty: true,
+            chunk_cols,
+            chunk_rows,
+            chunk_pixel_size,
+            chunks: Vec::with_capacity(total_chunks),
+            structure_apply: None,
+            grid_size,
+            border_thickness,
+        }
+    }
+
+    pub fn allocate_chunks_step(&mut self, time_budget_s: f32) -> bool {
+        let total = self.chunk_cols * self.chunk_rows;
+        if self.chunks.len() >= total {
+            return true;
+        }
+
+        let chunk_size_u32 = self.chunk_pixel_size.round().max(1.0) as u32;
+        let budget = time_budget_s.max(0.0001) as f64;
+        let start = get_time();
+        while self.chunks.len() < total && (get_time() - start) < budget {
+            let background = render_target(chunk_size_u32, chunk_size_u32);
+            let foreground = render_target(chunk_size_u32, chunk_size_u32);
+            let overlay = render_target(chunk_size_u32, chunk_size_u32);
+            background.texture.set_filter(FilterMode::Nearest);
+            foreground.texture.set_filter(FilterMode::Nearest);
+            overlay.texture.set_filter(FilterMode::Nearest);
+            self.chunks.push(Chunk {
+                background,
+                foreground,
+                overlay,
+                dirty_background: true,
+                dirty_foreground: true,
+                dirty_overlay: true,
+            });
+        }
+
+        self.chunks.len() >= total
+    }
+
+    pub fn allocate_chunks_progress(&self) -> f32 {
+        let total = (self.chunk_cols * self.chunk_rows).max(1) as f32;
+        (self.chunks.len() as f32 / total).clamp(0.0, 1.0)
+    }
+
+    pub fn start_structure_apply(&mut self, defs: Vec<StructureDef>, seed: u32) {
+        self.structure_apply = Some(StructureApplyState::new(self, defs, seed));
+    }
+
+    pub fn apply_structures_step(&mut self, time_budget_s: f32) -> bool {
+        let Some(mut state) = self.structure_apply.take() else {
+            return true;
+        };
+        let done = state.step(self, time_budget_s);
+        if !done {
+            self.structure_apply = Some(state);
+        }
+        done
+    }
+
+    pub fn structure_apply_progress(&self) -> f32 {
+        self.structure_apply
+            .as_ref()
+            .map(|state| state.progress())
+            .unwrap_or(1.0)
     }
 
     pub fn get_border_hitbox(&self) -> Rect {

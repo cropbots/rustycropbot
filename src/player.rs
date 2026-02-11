@@ -14,6 +14,7 @@ pub struct Player {
     dash_cooldown: f32,
     dash_dir: Vec2,
     collision_scratch: Vec<Rect>,
+    hp: f32,
 }
 
 impl Player {
@@ -29,6 +30,7 @@ impl Player {
             dash_cooldown: 0.0,
             dash_dir: Vec2::ZERO,
             collision_scratch: Vec::with_capacity(25),
+            hp: 100.0,
         }
     }
 
@@ -165,6 +167,22 @@ impl Player {
 
     pub fn position(&self) -> Vec2 {
         self.pos
+    }
+
+    pub fn world_hitbox(&self) -> Rect {
+        Rect::new(
+            self.pos.x + self.hitbox.x,
+            self.pos.y + self.hitbox.y,
+            self.hitbox.w,
+            self.hitbox.h,
+        )
+    }
+
+    pub fn apply_damage(&mut self, amount: f32) {
+        if amount <= 0.0 {
+            return;
+        }
+        self.hp = (self.hp - amount).max(0.0);
     }
 
     pub fn velocity(&self) -> Vec2 {

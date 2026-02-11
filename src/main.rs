@@ -1,6 +1,8 @@
 use macroquad::prelude::*;
 use miniquad::conf::{Icon, Platform};
 use image::imageops::FilterType;
+use std::future::poll_fn;
+use std::task::Poll;
 
 mod map;
 mod player;
@@ -11,9 +13,9 @@ mod particle;
 mod tilemap;
 mod sound;
 
-use map::{TileMap, TileSet, load_structures_from_dir};
+use map::{LayerKind, TileMap, TileSet, load_structures_from_dir};
 use player::Player;
-use entity::{Entity, EntityContext, EntityDatabase, MovementRegistry};
+use entity::{DamageEvent, Entity, EntityContext, EntityDatabase, MovementRegistry, PlayerTarget, Target};
 
 use sound::SoundSystem;
 use particle::ParticleSystem;
@@ -22,7 +24,10 @@ const CAMERA_DRAG: f32 = 5.0;
 const TILE_SIZE: f32 = 16.0;
 const MOVE_DEADZONE: f32 = 16.0;
 const FOOTSTEP_INTERVAL: f32 = 0.2;
-const CAMERA_FOV: f32 = 200.0;
+const CAMERA_FOV: f32 = 300.0;
+const LOADING_SPIN_SPEED: f32 = 3.0;
+const CHUNK_ALLOC_TIME_BUDGET_S: f32 = 0.0025;
+const STRUCTURE_APPLY_TIME_BUDGET_S: f32 = 0.0025;
 
 fn window_conf() -> Conf {
     let icon = load_window_icon(&helpers::asset_path("src/assets/favicon.png"));
@@ -62,31 +67,135 @@ fn load_window_icon(path: &str) -> Option<Icon> {
     Some(Icon { small, medium, big })
 }
 
+async fn show_loading(loading: &Texture2D, label: &str, progress: f32, spin: f32) {
+    let pct = (progress.clamp(0.0, 1.0) * 100.0).round();
+    let size = loading.size();
+    let scale = (screen_height() * 0.075).max(32.0) / size.y.max(1.0);
+    let draw_w = size.x * scale;
+    let draw_h = size.y * scale;
+    let pos = vec2(
+        (screen_width() - draw_w) * 0.5,
+        (screen_height() - draw_h) * 0.5,
+    );
+
+    set_default_camera();
+    clear_background(BLACK);
+    draw_texture_ex(
+        loading,
+        pos.x,
+        pos.y,
+        WHITE,
+        DrawTextureParams {
+            dest_size: Some(vec2(draw_w, draw_h)),
+            rotation: spin,
+            pivot: Some(vec2(pos.x + draw_w * 0.5, pos.y + draw_h * 0.5)),
+            ..Default::default()
+        },
+    );
+    draw_text(
+        &format!("{label} {pct:.0}%"),
+        20.0,
+        40.0,
+        30.0,
+        WHITE,
+    );
+    next_frame().await;
+}
+
+async fn await_with_loading<F, T>(
+    future: F,
+    loading: &Texture2D,
+    label: &str,
+    progress: f32,
+    spin: &mut f32,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let mut future = std::pin::pin!(future);
+    loop {
+        let polled = poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await;
+        match polled {
+            Poll::Ready(value) => return value,
+            Poll::Pending => {
+                *spin += LOADING_SPIN_SPEED * get_frame_time();
+                show_loading(loading, label, progress, *spin).await;
+            }
+        }
+    }
+}
+
 #[macroquad::main(window_conf)]
 async fn main() {
+    let loading = load_texture(&helpers::asset_path("src/assets/loading.png"))
+        .await
+        .unwrap_or_else(|_| Texture2D::empty());
+    loading.set_filter(FilterMode::Nearest);
+    let mut loading_spin = 0.0f32;
+    loading_spin += LOADING_SPIN_SPEED * get_frame_time();
+    show_loading(&loading, "Loading", 0.0, loading_spin).await;
+
     // Load the tileset atlas (tileset.json + tileset.png)
-    let tileset = TileSet::load("src/assets/tileset.json", "src/assets/tileset.png")
+    let tileset = await_with_loading(
+        TileSet::load("src/assets/tileset.json", "src/assets/tileset.png"),
+        &loading,
+        "Loading",
+        0.15,
+        &mut loading_spin,
+    )
         .await
         .unwrap_or_else(|err| {
             eprintln!("tileset load failed: {err}");
             eprintln!("Please ensure src/assets/tileset.json and src/assets/tileset.png exist");
             panic!("Tileset loading failed");
         });
-    let mut maps = TileMap::demo(512, 512, TILE_SIZE, tileset.count(), 0.0);
+    loading_spin += LOADING_SPIN_SPEED * get_frame_time();
+    show_loading(&loading, "Loading", 0.22, loading_spin).await;
+    let mut maps = TileMap::new_deferred(512, 512, TILE_SIZE, Vec2::new(TILE_SIZE, TILE_SIZE), 0.0);
+    while !maps.allocate_chunks_step(CHUNK_ALLOC_TIME_BUDGET_S) {
+        loading_spin += LOADING_SPIN_SPEED * get_frame_time();
+        show_loading(&loading, "Allocating map", maps.allocate_chunks_progress() * 0.25 + 0.22, loading_spin).await;
+    }
+    let grass = if tileset.count() > 24 { 24 } else { 0 };
+    maps.fill_layer(LayerKind::Background, grass);
+    loading_spin += LOADING_SPIN_SPEED * get_frame_time();
+    show_loading(&loading, "Loading", 0.35, loading_spin).await;
 
     // Load structures from JSON and apply them with a fixed seed.
-    let structures = load_structures_from_dir("src/structure").await.unwrap_or_else(|err| {
+    let structures = await_with_loading(
+        load_structures_from_dir("src/structure"),
+        &loading,
+        "Loading",
+        0.45,
+        &mut loading_spin,
+    )
+    .await
+    .unwrap_or_else(|err| {
         eprintln!("structure load failed: {err}");
         Vec::new()
     });
     if !structures.is_empty() {
-        maps.apply_structures(&structures, 1337);
+        maps.start_structure_apply(structures, 1337);
+        while !maps.apply_structures_step(STRUCTURE_APPLY_TIME_BUDGET_S) {
+            loading_spin += LOADING_SPIN_SPEED * get_frame_time();
+            show_loading(&loading, "Placing structures", maps.structure_apply_progress() * 0.15 + 0.45, loading_spin).await;
+        }
     }
+    loading_spin += LOADING_SPIN_SPEED * get_frame_time();
+    show_loading(&loading, "Loading", 0.55, loading_spin).await;
 
     // Player
-    let player_texture = helpers::load_single_texture("src/assets/objects", "player08")
-        .await
-        .unwrap_or_else(Texture2D::empty);
+    let player_texture = await_with_loading(
+        helpers::load_single_texture("src/assets/objects", "player08"),
+        &loading,
+        "Loading",
+        0.6,
+        &mut loading_spin,
+    )
+    .await
+    .unwrap_or_else(Texture2D::empty);
+    loading_spin += LOADING_SPIN_SPEED * get_frame_time();
+    show_loading(&loading, "Loading", 0.65, loading_spin).await;
     let mut player = Player::new(
         vec2(200.0, 300.0 + 16.0 / 2.0),
         player_texture,
@@ -117,38 +226,65 @@ async fn main() {
 
     // Entity registry
     let registry = MovementRegistry::new();
-    let db = EntityDatabase::load_from("src/entity")
+    let db = await_with_loading(
+        EntityDatabase::load_from("src/entity"),
+        &loading,
+        "Loading",
+        0.7,
+        &mut loading_spin,
+    )
         .await
         .unwrap_or_else(|err| {
             eprintln!("entity load failed: {err}");
             EntityDatabase::empty()
         });
+    loading_spin += LOADING_SPIN_SPEED * get_frame_time();
+    show_loading(&loading, "Loading", 0.75, loading_spin).await;
 
     let mut entities = Vec::<Entity>::new();
-    if let Some(virat) = Entity::spawn(&db, "virat", vec2(100.0, 100.0), &registry) {
-        entities.push(virat);
+    for _ in 0..10 {
+        if let Some(virat) = Entity::spawn(&db, "virat", vec2(100.0, 100.0), &registry) {
+            entities.push(virat);
+        }
     }
     let mut draw_order: Vec<usize> = Vec::new();
 
     // Particle system
-    let mut particles = ParticleSystem::load_from("src/particle")
+    let mut particles = await_with_loading(
+        ParticleSystem::load_from("src/particle"),
+        &loading,
+        "Loading",
+        0.8,
+        &mut loading_spin,
+    )
         .await
         .unwrap_or_else(|err| {
             eprintln!("particle load failed: {err}");
             ParticleSystem::empty()
         });
+    loading_spin += LOADING_SPIN_SPEED * get_frame_time();
+    show_loading(&loading, "Loading", 0.85, loading_spin).await;
     let mut walk_trail = particles.emitter("dust_trail", player.position());
     let mut dash_trail = particles.emitter("dash_afterimage", player.position());
 
     // Load sounds
-    let sounds = SoundSystem::load_from("src/sound")
+    let sounds = await_with_loading(
+        SoundSystem::load_from("src/sound"),
+        &loading,
+        "Loading",
+        0.9,
+        &mut loading_spin,
+    )
         .await
         .unwrap_or_else(|err| {
             eprintln!("sound load failed: {err}");
             SoundSystem::empty()
         });
+    loading_spin += LOADING_SPIN_SPEED * get_frame_time();
+    show_loading(&loading, "Loading", 0.98, loading_spin).await;
 
     let mut footstep_timer = 0.0f32;
+    let mut damage_events: Vec<DamageEvent> = Vec::new();
     
     loop {
         let dt = get_frame_time();
@@ -182,9 +318,20 @@ async fn main() {
             None
         };
 
-        let view_rect = camera_view_rect(camera.target, CAMERA_FOV);
+        let view_rect = camera_view_rect_logic(camera.target, CAMERA_FOV);
         let sim_rect = scale_rect(view_rect, 2.0);
         let delete_rect = scale_rect(view_rect, 4.0);
+
+        damage_events.clear();
+        let mut ctx = EntityContext {
+            player: Some(PlayerTarget {
+                pos: player.position(),
+                hitbox: player.world_hitbox(),
+            }),
+            target: None,
+            view_height: CAMERA_FOV,
+            damage_events: Vec::new(),
+        };
 
         let mut ent_idx = 0usize;
         while ent_idx < entities.len() {
@@ -195,10 +342,44 @@ async fn main() {
             }
 
             if hb.overlaps(&sim_rect) {
-                entities[ent_idx].update(dt, &db, &EntityContext { target: Some(player.position()) }, &maps);
+                entities[ent_idx].update(dt, &db, &mut ctx, &maps, &registry);
                 entities[ent_idx].clamp_to_map(&maps, &db);
             }
             ent_idx += 1;
+        }
+        damage_events.extend(ctx.damage_events.drain(..));
+
+        for ent in entities.iter_mut() {
+            let def = &db.entities[ent.instance.def];
+            let render_origin = ent.instance.pos + def.texture.draw.offset;
+            let size = def
+                .texture
+                .draw
+                .dest_size
+                .unwrap_or_else(|| def.texture.texture.size());
+            let pos = render_origin + size * 0.5;
+            if ent.instance.is_dashing() {
+                if ent.instance.dash_trail.is_none() {
+                    ent.instance.dash_trail = particles.emitter("dash_afterimage", pos);
+                }
+                if let Some(emitter) = ent.instance.dash_trail.as_mut() {
+                    particles.update_emitter_with_texture(
+                        emitter,
+                        pos,
+                        dt,
+                        Some(&def.texture.texture),
+                    );
+                }
+            } else if let Some(emitter) = ent.instance.dash_trail.as_mut() {
+                particles.track_emitter(emitter, pos);
+            }
+        }
+
+        for event in &damage_events {
+            match event.target {
+                Target::Player(_) => player.apply_damage(event.amount),
+                Target::Entity(_) | Target::Position(_) => {}
+            }
         }
 
         let dashing = player.is_dashing();
@@ -317,18 +498,18 @@ async fn main() {
 
 fn camera_zoom_for_fov(view_height: f32, render_target: bool) -> Vec2 {
     let view_h = view_height.max(1.0);
-    let view_w = view_h * screen_width().max(1.0) / screen_height().max(1.0);
+    let aspect = screen_width().max(1.0) / screen_height().max(1.0);
+    let view_w = view_h * aspect;
     let y_sign = if render_target { -1.0 } else { 1.0 };
     vec2(2.0 / view_w, y_sign * 2.0 / view_h)
 }
 
-fn camera_view_rect(target: Vec2, view_height: f32) -> Rect {
+fn camera_view_rect_logic(target: Vec2, view_height: f32) -> Rect {
     let view_h = view_height.max(1.0);
-    let view_w = view_h * screen_width().max(1.0) / screen_height().max(1.0);
     Rect::new(
-        target.x - view_w * 0.5,
+        target.x - view_h * 0.5,
         target.y - view_h * 0.5,
-        view_w,
+        view_h,
         view_h,
     )
 }
