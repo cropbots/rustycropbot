@@ -9,16 +9,23 @@
     191,192
   ],
   "colliders": [
-    false, false, 
-    false, false, 
-    true, true
+    0, 0, 
+    0, 0, 
+    2, 1
   ],
+  "interactors": [
+    0, 0,
+    0, 0,
+    0, 0
+  ],
+  "on_interact": [],
+  "interact_range": 0.0,
   "overlay": [
     157,158,
     174,175,
     0,0
   ],
-  "frequency": 0.05,
-  "max_per_map": 7500,
+  "frequency": 0.025,
+  "max_per_map": 4294967295,
   "min_distance": 5.0
 }

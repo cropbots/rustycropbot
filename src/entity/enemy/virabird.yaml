@@ -2,7 +2,7 @@ id: virabird
 traits:
   - target_player
   - no_map_collision
-  #- no_entity_collision
+  - no_entity_collision
 stats:
   hp: 2
   speed: 200

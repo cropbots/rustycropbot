@@ -1,4 +1,6 @@
 use macroquad::prelude::*;
+use macroquad::file::load_string;
+use serde::Deserialize;
 
 pub fn random_u32() -> u32 {
     macroquad::rand::rand()
@@ -58,6 +60,28 @@ pub fn data_path(path: &str) -> String {
 
 pub fn asset_dir(subdir: &str) -> String {
     format!("{}/{}", asset_root(), subdir.trim_start_matches('/'))
+}
+
+#[derive(Deserialize)]
+struct WasmIndexFile {
+    files: Vec<String>,
+}
+
+pub async fn load_wasm_manifest_files(dir: &str, fallback: &[&str]) -> Vec<String> {
+    let index_path = format!("{}/index.json", dir.trim_end_matches('/'));
+    if let Ok(raw) = load_string(&index_path).await {
+        if let Ok(parsed) = serde_json::from_str::<WasmIndexFile>(&raw) {
+            let files: Vec<String> = parsed
+                .files
+                .into_iter()
+                .filter(|name| !name.trim().is_empty())
+                .collect();
+            if !files.is_empty() {
+                return files;
+            }
+        }
+    }
+    fallback.iter().map(|name| (*name).to_string()).collect()
 }
 
 pub async fn draw_hitbox(hitbox: Rect, pos: Vec2) {

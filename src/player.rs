@@ -20,7 +20,7 @@ pub struct Player {
 
 impl Player {
     pub fn new(pos: Vec2, texture: Texture2D, hitbox: Rect) -> Self {
-        let max_hp = 30.0;
+        let max_hp = 1000.0;
         Self {
             pos,
             vel: Vec2::ZERO,

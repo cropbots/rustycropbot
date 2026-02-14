@@ -1,0 +1,39 @@
+id: chopbot
+traits:
+  - target_nearest_enemy
+  - no_map_collision
+  - no_player_collision
+stats:
+  hp: 5
+  speed: 200
+  damage: 1
+visuals:
+  sprite: "src/assets/objects/chopbot.png"
+  draw_params:
+    # 3.005780347 x 3.008849558
+    dest_size: [11.16, 10]
+    rotation: 0.0
+    flip_x: false
+    flip_y: false
+    pivot: [0, 0]
+    color: [255, 255, 255, 255]
+    offset: [0, 0]
+hitbox:
+  x: 0
+  y: 0
+  w: 11.16
+  h: 10
+behavior:
+  type: selector
+  children:
+    - type: sequence
+      children:
+        - type: condition
+          name: target_in_range
+          value: 0.25 # the viewport is 1.0 in width and height
+        - type: action
+          name: dash_at_target
+          params:
+            cooldown: 1.0
+    - type: action
+      name: seek

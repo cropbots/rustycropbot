@@ -3,7 +3,7 @@ use macroquad::file::load_string;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
-use crate::helpers::{asset_path, data_path};
+use crate::helpers::{asset_path, data_path, load_wasm_manifest_files};
 
 #[derive(Debug)]
 pub enum ParticleLoadError {
@@ -348,7 +348,7 @@ impl ParticleSystem {
 
         if cfg!(target_arch = "wasm32") {
             let dir = data_path(&dir.to_string_lossy());
-            let files = ["trail.yaml", "dash.yaml"];
+            let files = load_wasm_manifest_files(&dir, &["trail.yaml", "dash.yaml"]).await;
             for file in files {
                 let path = format!("{}/{}", dir, file);
                 let raw_str = load_string(&path)

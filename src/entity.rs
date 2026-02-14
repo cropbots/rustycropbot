@@ -1,6 +1,6 @@
 use macroquad::prelude::*;
 use macroquad::file::load_string;
-use crate::helpers::{asset_path, data_path};
+use crate::helpers::{asset_path, data_path, load_wasm_manifest_files};
 use serde::Deserialize;
 use serde_yaml::Value as YamlValue;
 use std::collections::HashMap;
@@ -126,6 +126,8 @@ pub enum BehaviorNode {
     Condition { name: String, value: Option<f32> },
     Action {
         name: String,
+        #[serde(default)]
+        multiple: bool,
         #[serde(default)]
         params: MovementParams,
         #[serde(flatten)]
@@ -282,6 +284,7 @@ pub struct EntityTarget {
     pub kind: EntityKind,
     pub pos: Vec2,
     pub hitbox: Rect,
+    pub alive: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -347,40 +350,41 @@ impl EntityInstance {
         }
 
         let def = &db.entities[self.def];
-        let desired = def
+        let mut desired_actions = def
             .behavior_tree
             .as_ref()
-            .and_then(|tree| select_action(tree, self, ctx))
-            .unwrap_or(SelectedAction {
-                name: "idle",
+            .map(|tree| select_actions(tree, self, ctx))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| registry.has(&a.name))
+            .collect::<Vec<_>>();
+        if desired_actions.is_empty() {
+            desired_actions.push(SelectedAction {
+                name: "idle".to_string(),
                 params: MovementParams::new(),
             });
-        let (desired_action, desired_params) = if registry.has(desired.name) {
-            (desired.name, desired.params)
-        } else {
-            ("idle", MovementParams::new())
-        };
-
-        if self.behaviors.is_empty() {
-            self.behaviors.push(BehaviorRuntime {
-                name: desired_action.to_string(),
-                func: registry.resolve(desired_action),
-                params: desired_params.clone(),
-                timer: 0.0,
-                dir: Vec2::ZERO,
-                cooldown: 0.0,
-            });
         }
-        if let Some(behavior) = self.behaviors.first_mut() {
-            if behavior.name != desired_action || behavior.params != desired_params {
-                behavior.name = desired_action.to_string();
-                behavior.func = registry.resolve(desired_action);
-                behavior.params = desired_params.clone();
-                behavior.timer = 0.0;
-                behavior.dir = Vec2::ZERO;
-                behavior.cooldown = 0.0;
+
+        let mut existing = std::mem::take(&mut self.behaviors);
+        let mut synced = Vec::with_capacity(desired_actions.len());
+        for desired in desired_actions {
+            if let Some(index) = existing
+                .iter()
+                .position(|b| b.name == desired.name && b.params == desired.params)
+            {
+                synced.push(existing.remove(index));
+            } else {
+                synced.push(BehaviorRuntime {
+                    name: desired.name.clone(),
+                    func: registry.resolve(&desired.name),
+                    params: desired.params.clone(),
+                    timer: 0.0,
+                    dir: Vec2::ZERO,
+                    cooldown: 0.0,
+                });
             }
         }
+        self.behaviors = synced;
 
         let mut behaviors = std::mem::take(&mut self.behaviors);
         for behavior in behaviors.iter_mut() {
@@ -392,15 +396,16 @@ impl EntityInstance {
         self.behaviors = behaviors;
 
         let mut max_speed = self.speed.max(1.0);
-        if let Some(behavior) = self.behaviors.first() {
-            if behavior.name == "dash_at_target" && behavior.timer > 0.0 {
+        for behavior in self.behaviors.iter() {
+            if behavior.name != "dash_at_target" || behavior.timer <= 0.0 {
+                continue;
+            }
                 let dash_speed = behavior
                     .params
                     .get("dash_speed")
                     .copied()
                     .unwrap_or(2200.0);
                 max_speed = max_speed.max(dash_speed.abs());
-            }
         }
         let speed = self.vel.length();
         if speed > max_speed {
@@ -505,8 +510,61 @@ impl EntityInstance {
         let Some(target) = self.current_target else {
             return;
         };
-        let Some(target_hitbox) = target.hitbox() else {
-            return;
+        let def_flags = db.entities[self.def].flags;
+        let target_any = (def_flags & DEF_FLAG_TARGET_NEAREST_ENTITY) != 0;
+        let target_enemy = (def_flags & DEF_FLAG_TARGET_NEAREST_ENEMY) != 0;
+        let target_friend = (def_flags & DEF_FLAG_TARGET_NEAREST_FRIEND) != 0;
+        let target_misc = (def_flags & DEF_FLAG_TARGET_NEAREST_MISC) != 0;
+        let has_specific_target_flags = target_enemy || target_friend || target_misc;
+        let target_player = (def_flags & DEF_FLAG_TARGET_PLAYER) != 0;
+
+        let target_hitbox = match target {
+            Target::Position(_) => return,
+            Target::Player(_) => {
+                if !target_player {
+                    return;
+                }
+                let Some(player) = ctx.player else {
+                    return;
+                };
+                player.hitbox
+            }
+            Target::Entity(target_entity) => {
+                let Some(target_live) = ctx
+                    .entities
+                    .iter()
+                    .find(|candidate| candidate.id == target_entity.id && candidate.alive)
+                else {
+                    return;
+                };
+                let kind_ok = match target_live.kind {
+                    EntityKind::Enemy => {
+                        if has_specific_target_flags {
+                            target_enemy
+                        } else {
+                            target_any || target_enemy
+                        }
+                    }
+                    EntityKind::Friend => {
+                        if has_specific_target_flags {
+                            target_friend
+                        } else {
+                            target_any || target_friend
+                        }
+                    }
+                    EntityKind::Misc => {
+                        if has_specific_target_flags {
+                            target_misc
+                        } else {
+                            target_any || target_misc
+                        }
+                    }
+                };
+                if !kind_ok {
+                    return;
+                }
+                target_live.hitbox
+            }
         };
 
         let hb = db.entities[self.def].world_hitbox(self.pos);
@@ -576,6 +634,30 @@ impl EntityContext {
         let target_enemy = (def_flags & DEF_FLAG_TARGET_NEAREST_ENEMY) != 0;
         let target_friend = (def_flags & DEF_FLAG_TARGET_NEAREST_FRIEND) != 0;
         let target_misc = (def_flags & DEF_FLAG_TARGET_NEAREST_MISC) != 0;
+        let has_specific_target_flags = target_enemy || target_friend || target_misc;
+        let is_kind_targetable = |kind: EntityKind| match kind {
+            EntityKind::Enemy => {
+                if has_specific_target_flags {
+                    target_enemy
+                } else {
+                    target_any || target_enemy
+                }
+            }
+            EntityKind::Friend => {
+                if has_specific_target_flags {
+                    target_friend
+                } else {
+                    target_any || target_friend
+                }
+            }
+            EntityKind::Misc => {
+                if has_specific_target_flags {
+                    target_misc
+                } else {
+                    target_any || target_misc
+                }
+            }
+        };
         let mask = (target_any as u8)
             | ((target_enemy as u8) << 1)
             | ((target_friend as u8) << 2)
@@ -585,7 +667,22 @@ impl EntityContext {
             return None;
         }
         if let Some(cached) = self.target_cache.get(&(entity.uid, mask)).copied() {
-            return cached.map(Target::Entity);
+            if let Some(cached_target) = cached {
+                let current_target = self
+                    .entities
+                    .iter()
+                    .find(|candidate| {
+                        candidate.id == cached_target.id
+                            && candidate.alive
+                            && is_kind_targetable(candidate.kind)
+                    })
+                    .copied();
+                if let Some(target) = current_target {
+                    return Some(Target::Entity(target));
+                }
+            } else {
+                return None;
+            }
         }
 
         let mut best: Option<(f32, EntityTarget)> = None;
@@ -593,11 +690,10 @@ impl EntityContext {
             if candidate.id == entity.uid {
                 continue;
             }
-            let kind_ok = match candidate.kind {
-                EntityKind::Enemy => target_any || target_enemy,
-                EntityKind::Friend => target_any || target_friend,
-                EntityKind::Misc => target_any || target_misc,
-            };
+            if !candidate.alive {
+                continue;
+            }
+            let kind_ok = is_kind_targetable(candidate.kind);
             if !kind_ok {
                 continue;
             }
@@ -867,8 +963,8 @@ fn collect_dynamic_collision_hitboxes(
     }
 }
 
-struct SelectedAction<'a> {
-    name: &'a str,
+struct SelectedAction {
+    name: String,
     params: MovementParams,
 }
 
@@ -886,56 +982,89 @@ fn action_params(params: &MovementParams, extra: &HashMap<String, YamlValue>) ->
     merged
 }
 
-fn select_action<'a>(
-    node: &'a BehaviorNode,
+fn eval_behavior(
+    node: &BehaviorNode,
     entity: &EntityInstance,
     ctx: &EntityContext,
-) -> Option<SelectedAction<'a>> {
-    let (action, ok) = eval_behavior(node, entity, ctx);
-    if ok {
-        action
-    } else {
-        None
-    }
-}
-
-fn eval_behavior<'a>(
-    node: &'a BehaviorNode,
-    entity: &EntityInstance,
-    ctx: &EntityContext,
-) -> (Option<SelectedAction<'a>>, bool) {
+) -> (Option<SelectedAction>, Vec<SelectedAction>, bool) {
     match node {
-        BehaviorNode::Action { name, params, extra } => (
-            Some(SelectedAction {
-                name: name.as_str(),
+        BehaviorNode::Action {
+            name,
+            multiple,
+            params,
+            extra,
+        } => {
+            let action = SelectedAction {
+                name: name.clone(),
                 params: action_params(params, extra),
-            }),
-            true,
-        ),
-        BehaviorNode::Condition { name, value } => (None, eval_condition(name, *value, entity, ctx)),
+            };
+            let mut multi = Vec::new();
+            if *multiple {
+                multi.push(SelectedAction {
+                    name: action.name.clone(),
+                    params: action.params.clone(),
+                });
+            }
+            (Some(action), multi, true)
+        }
+        BehaviorNode::Condition { name, value } => (None, Vec::new(), eval_condition(name, *value, entity, ctx)),
         BehaviorNode::Sequence { children } => {
             let mut action = None;
+            let mut multiple_actions = Vec::new();
             for child in children {
-                let (child_action, ok) = eval_behavior(child, entity, ctx);
+                let (child_action, child_multiple, ok) = eval_behavior(child, entity, ctx);
                 if !ok {
-                    return (None, false);
+                    return (None, Vec::new(), false);
                 }
                 if child_action.is_some() {
                     action = child_action;
                 }
+                multiple_actions.extend(child_multiple);
             }
-            (action, true)
+            (action, multiple_actions, true)
         }
         BehaviorNode::Selector { children } => {
+            let mut primary: Option<SelectedAction> = None;
+            let mut multiple_actions = Vec::new();
+            let mut any_ok = false;
             for child in children {
-                let (child_action, ok) = eval_behavior(child, entity, ctx);
+                let (child_action, child_multiple, ok) = eval_behavior(child, entity, ctx);
                 if ok {
-                    return (child_action, true);
+                    any_ok = true;
+                    if primary.is_none() {
+                        primary = child_action;
+                    }
+                    multiple_actions.extend(child_multiple);
                 }
             }
-            (None, false)
+            (primary, multiple_actions, any_ok)
         }
     }
+}
+
+fn select_actions(
+    node: &BehaviorNode,
+    entity: &EntityInstance,
+    ctx: &EntityContext,
+) -> Vec<SelectedAction> {
+    let (primary, multiple, ok) = eval_behavior(node, entity, ctx);
+    if !ok {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    if let Some(primary) = primary {
+        out.push(primary);
+    }
+    for action in multiple {
+        let duplicate = out
+            .iter()
+            .any(|existing| existing.name == action.name && existing.params == action.params);
+        if !duplicate {
+            out.push(action);
+        }
+    }
+    out
 }
 
 fn eval_condition(name: &str, value: Option<f32>, entity: &EntityInstance, ctx: &EntityContext) -> bool {
@@ -1092,7 +1221,7 @@ fn load_traits(dir: &Path) -> Result<Vec<TraitDef>, EntityLoadError> {
 
 async fn load_behaviors_wasm(dir: &str) -> Result<Vec<BehaviorDef>, EntityLoadError> {
     let mut behaviors = Vec::new();
-    let files = ["goblin.yaml"];
+    let files = load_wasm_manifest_files(dir, &["goblin.yaml"]).await;
     for file in files {
         let path = format!("{}/{}", dir, file);
         let raw_str = load_string(&path)
@@ -1109,7 +1238,7 @@ async fn load_behaviors_wasm(dir: &str) -> Result<Vec<BehaviorDef>, EntityLoadEr
 
 async fn load_traits_wasm(dir: &str) -> Result<Vec<TraitDef>, EntityLoadError> {
     let mut traits = Vec::new();
-    let files = ["hostile.yaml"];
+    let files = load_wasm_manifest_files(dir, &["hostile.yaml"]).await;
     for file in files {
         let path = format!("{}/{}", dir, file);
         let raw_str = load_string(&path)
@@ -1141,10 +1270,10 @@ async fn load_entities_from_dir_wasm(
     entities: &mut Vec<EntityDef>,
     entity_lookup: &mut HashMap<String, usize>,
 ) -> Result<(), EntityLoadError> {
-    let files: &[&str] = if dir.ends_with("/enemy") {
-        &["virat.yaml", "virabird.yaml"]
+    let files = if dir.ends_with("/enemy") {
+        load_wasm_manifest_files(dir, &["virat.yaml", "virabird.yaml"]).await
     } else {
-        &[]
+        load_wasm_manifest_files(dir, &[]).await
     };
 
     let kind_from_dir = dir
@@ -1153,13 +1282,21 @@ async fn load_entities_from_dir_wasm(
         .and_then(EntityKind::from_dir)
         .unwrap_or(fallback_kind);
 
-    for file in files {
+    for file in &files {
         let path = format!("{}/{}", dir, file);
         let raw_str = load_string(&path)
             .await
             .map_err(|e| EntityLoadError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
         let raw: EntityFile = serde_yaml::from_str(&raw_str)?;
-        let kind = raw.kind.unwrap_or(kind_from_dir);
+        if let Some(kind_override) = raw.kind {
+            if kind_override != kind_from_dir {
+                eprintln!(
+                    "entity '{}' kind override {:?} ignored; using directory kind {:?}",
+                    raw.id, kind_override, kind_from_dir
+                );
+            }
+        }
+        let kind = kind_from_dir;
 
         let mut trait_indices = Vec::with_capacity(raw.traits.len());
         for id in raw.traits {
@@ -1285,7 +1422,15 @@ async fn load_entities_from_dir(
             continue;
         }
         let raw: EntityFile = serde_yaml::from_str(&std::fs::read_to_string(&path)?)?;
-        let kind = raw.kind.unwrap_or(kind_from_dir);
+        if let Some(kind_override) = raw.kind {
+            if kind_override != kind_from_dir {
+                eprintln!(
+                    "entity '{}' kind override {:?} ignored; using directory kind {:?}",
+                    raw.id, kind_override, kind_from_dir
+                );
+            }
+        }
+        let kind = kind_from_dir;
 
         let mut trait_indices = Vec::with_capacity(raw.traits.len());
         for id in raw.traits {

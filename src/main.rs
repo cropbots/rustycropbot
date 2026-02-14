@@ -13,6 +13,7 @@ mod r#trait;
 mod particle;
 mod tilemap;
 mod sound;
+mod interact;
 
 use map::{LayerKind, TileMap, TileSet, load_structures_from_dir};
 use player::Player;
@@ -20,6 +21,7 @@ use entity::{DamageEvent, Entity, EntityContext, EntityDatabase, MovementRegistr
 
 use sound::SoundSystem;
 use particle::ParticleSystem;
+use interact::{InteractContext, InteractRegistry};
 
 const CAMERA_DRAG: f32 = 5.0;
 const TILE_SIZE: f32 = 16.0;
@@ -28,7 +30,7 @@ const FOOTSTEP_INTERVAL: f32 = 0.2;
 const CAMERA_FOV: f32 = 300.0;
 const ENTITY_CULL_FADE_PAD: f32 = 96.0;
 const LOADING_SPIN_SPEED: f32 = 3.0;
-const STRUCTURE_APPLY_TIME_BUDGET_S: f32 = 0.005;
+const STRUCTURE_APPLY_TIME_BUDGET_S: f32 = 0.01;
 const CHUNK_ALLOC_PER_FRAME: usize = 6;
 const CHUNK_REBUILD_PER_FRAME: usize = 8;
 
@@ -154,7 +156,7 @@ async fn main() {
         });
     loading_spin += LOADING_SPIN_SPEED * get_frame_time();
     show_loading(&loading, "Loading", 0.22, loading_spin).await;
-    let mut maps = TileMap::new_deferred(512, 512, TILE_SIZE, Vec2::new(TILE_SIZE, TILE_SIZE), 0.0);
+    let mut maps = TileMap::new_deferred(1024, 1024, TILE_SIZE, Vec2::new(TILE_SIZE, TILE_SIZE), 0.0);
     maps.set_chunk_work_budget(CHUNK_ALLOC_PER_FRAME, CHUNK_REBUILD_PER_FRAME);
     let grass: u8 = if tileset.count() > 24 { 24 } else { 0 };
     maps.fill_layer(LayerKind::Background, grass);
@@ -253,16 +255,16 @@ async fn main() {
     show_loading(&loading, "Loading", 0.75, loading_spin).await;
 
     let mut entities = Vec::<Entity>::new();
-    for _ in 0..100 {
+    for _ in 0..2 {
         let pos = vec2(
             helpers::random_range(0.0, 500.0),
             helpers::random_range(0.0, 500.0),
         );
-        if let Some(virat) = Entity::spawn(&db, "virabird", pos, &registry) {
-            entities.push(virat);
+        if let Some(virabird) = Entity::spawn(&db, "virabird", pos, &registry) {
+            entities.push(virabird);
         }
     }
-    for _ in 0..50 {
+    for _ in 0..3 {
         let pos = vec2(
             helpers::random_range(0.0, 500.0),
             helpers::random_range(0.0, 500.0),
@@ -271,6 +273,17 @@ async fn main() {
             entities.push(virat);
         }
     }
+
+    for _ in 0..1 {
+        let pos = vec2(
+            helpers::random_range(0.0, 500.0),
+            helpers::random_range(0.0, 500.0),
+        );
+        if let Some(chopbot) = Entity::spawn(&db, "chopbot", pos, &registry) {
+            entities.push(chopbot);
+        }
+    }
+
     let mut draw_order: Vec<usize> = Vec::new();
 
     // Particle system
@@ -311,6 +324,7 @@ async fn main() {
     let mut damage_events: Vec<DamageEvent> = Vec::new();
     let mut entity_target_cache: HashMap<(u64, u8), Option<entity::EntityTarget>> = HashMap::new();
     let mut player_dead = false;
+    let interact_registry = InteractRegistry::new();
     
     loop {
         let dt = get_frame_time();
@@ -349,7 +363,29 @@ async fn main() {
         maps.prewarm_visible_chunks(camera.target, camera.zoom);
 
         let view_rect = camera_view_rect_logic(camera.target, CAMERA_FOV);
-        let sim_rect = scale_rect(view_rect, 2.0);
+        let mouse_screen = mouse_position();
+        let mouse_world = camera.screen_to_world(vec2(mouse_screen.0, mouse_screen.1));
+        let player_pos = player.position();
+        let hovered_interactor = maps
+            .structure_interactors()
+            .iter()
+            .find(|interactor| {
+                point_in_rect(mouse_world, interactor.rect)
+                    && interactor_in_range(player_pos, interactor.group_rect, interactor.interact_range_world)
+            })
+            .cloned();
+
+        if is_mouse_button_pressed(MouseButton::Left) {
+            if let Some(interactor) = hovered_interactor.as_ref() {
+                let mut ctx = InteractContext {
+                    structure_id: &interactor.structure_id,
+                    area: interactor.group_rect,
+                    player: &mut player,
+                    map: &mut maps,
+                };
+                interact_registry.execute(&interactor.on_interact, &mut ctx);
+            }
+        }
 
         let mut entity_targets = Vec::with_capacity(entities.len());
         for ent in &entities {
@@ -360,12 +396,13 @@ async fn main() {
                 kind: def.kind,
                 pos: ent.instance.pos,
                 hitbox: ent.hitbox(&db),
+                alive: ent.instance.hp > 0.0,
             });
         }
 
         damage_events.clear();
         let mut ctx = EntityContext {
-            player: if player_dead {
+            player: if player_dead || player.hp() <= 0.0 {
                 None
             } else {
                 Some(PlayerTarget {
@@ -382,11 +419,8 @@ async fn main() {
 
         let mut ent_idx = 0usize;
         while ent_idx < entities.len() {
-            let hb = entities[ent_idx].hitbox(&db);
-            if hb.overlaps(&sim_rect) {
-                entities[ent_idx].update(dt, &db, &mut ctx, &maps, &registry);
-                entities[ent_idx].clamp_to_map(&maps, &db);
-            }
+            entities[ent_idx].update(dt, &db, &mut ctx, &maps, &registry);
+            entities[ent_idx].clamp_to_map(&maps, &db);
             ent_idx += 1;
         }
         resolve_entity_overlaps(&mut entities, &db, &maps);
@@ -543,6 +577,24 @@ async fn main() {
             screen_height(),
         );
 
+        if let Some(interactor) = hovered_interactor.as_ref() {
+            draw_rectangle(
+                interactor.group_rect.x,
+                interactor.group_rect.y,
+                interactor.group_rect.w,
+                interactor.group_rect.h,
+                Color::new(1.0, 0.95, 0.2, 0.2),
+            );
+            draw_rectangle_lines(
+                interactor.group_rect.x,
+                interactor.group_rect.y,
+                interactor.group_rect.w,
+                interactor.group_rect.h,
+                1.0,
+                Color::new(1.0, 0.95, 0.2, 0.95),
+            );
+        }
+
         set_default_camera();
         if use_render_target {
             draw_texture_ex(
@@ -648,6 +700,24 @@ fn offscreen_fade_alpha(hitbox: Rect, view_rect: Rect, fade_pad: f32) -> f32 {
     let nearest_y = cy.clamp(view_rect.y, view_rect.y + view_rect.h);
     let distance = vec2(cx - nearest_x, cy - nearest_y).length();
     (1.0 - distance / fade_pad.max(1.0)).clamp(0.0, 1.0)
+}
+
+fn point_in_rect(point: Vec2, rect: Rect) -> bool {
+    point.x >= rect.x
+        && point.y >= rect.y
+        && point.x <= rect.x + rect.w
+        && point.y <= rect.y + rect.h
+}
+
+fn interactor_in_range(player_pos: Vec2, area: Rect, range_world: f32) -> bool {
+    if range_world <= 0.0 {
+        return true;
+    }
+    let nearest = vec2(
+        player_pos.x.clamp(area.x, area.x + area.w),
+        player_pos.y.clamp(area.y, area.y + area.h),
+    );
+    player_pos.distance(nearest) <= range_world
 }
 
 fn resolve_entity_overlaps(entities: &mut [Entity], db: &EntityDatabase, map: &TileMap) {

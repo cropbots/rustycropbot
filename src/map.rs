@@ -2,7 +2,7 @@ use macroquad::prelude::*;
 use macroquad::file::load_string;
 use serde::Deserialize;
 use std::path::Path;
-use crate::helpers::{asset_path, data_path};
+use crate::helpers::{asset_path, data_path, load_wasm_manifest_files};
 
 const EMPTY_TILE: u8 = u8::MAX;
 const CHUNK_SIZE: usize = 32;
@@ -137,12 +137,14 @@ pub struct Structure {
     background: Vec<u8>,
     foreground: Vec<u8>,
     overlay: Vec<u8>,
-    colliders: Vec<bool>,
+    colliders: Vec<u8>,
+    interactors: Vec<u8>,
     background_updates: Vec<(usize, usize, u8)>,
     foreground_updates: Vec<(usize, usize, u8)>,
     overlay_updates: Vec<(usize, usize, u8)>,
     occupied_offsets: Vec<(usize, usize)>,
-    collider_offsets: Vec<(usize, usize)>,
+    collider_offsets: Vec<(usize, usize, u8)>,
+    interactor_offsets: Vec<(usize, usize, u8)>,
 }
 
 impl Structure {
@@ -151,7 +153,8 @@ impl Structure {
         let mut background = vec![EMPTY_TILE; len];
         let mut foreground = vec![EMPTY_TILE; len];
         let mut overlay = vec![EMPTY_TILE; len];
-        let colliders = vec![false; len];
+        let colliders = vec![0u8; len];
+        let interactors = vec![0u8; len];
         let max = (tile_count.max(1).min(u8::MAX as usize - 1)) as u32;
 
         for y in 0..height {
@@ -170,7 +173,15 @@ impl Structure {
             }
         }
 
-        Self::new(width, height, background, foreground, overlay, colliders)
+        Self::new(
+            width,
+            height,
+            background,
+            foreground,
+            overlay,
+            colliders,
+            interactors,
+        )
     }
 
     pub fn new(
@@ -179,7 +190,8 @@ impl Structure {
         background: Vec<u8>,
         foreground: Vec<u8>,
         overlay: Vec<u8>,
-        colliders: Vec<bool>,
+        colliders: Vec<u8>,
+        interactors: Vec<u8>,
     ) -> Self {
         let mut structure = Self {
             width,
@@ -188,11 +200,13 @@ impl Structure {
             foreground,
             overlay,
             colliders,
+            interactors,
             background_updates: Vec::new(),
             foreground_updates: Vec::new(),
             overlay_updates: Vec::new(),
             occupied_offsets: Vec::new(),
             collider_offsets: Vec::new(),
+            interactor_offsets: Vec::new(),
         };
         structure.rebuild_cache();
         structure
@@ -204,6 +218,7 @@ impl Structure {
         self.overlay_updates.clear();
         self.occupied_offsets.clear();
         self.collider_offsets.clear();
+        self.interactor_offsets.clear();
 
         for y in 0..self.height {
             for x in 0..self.width {
@@ -228,9 +243,17 @@ impl Structure {
                     occupied = true;
                 }
 
-                let collider = self.colliders.get(i).copied().unwrap_or(false);
-                if collider {
-                    self.collider_offsets.push((x, y));
+                let collider = self.colliders.get(i).copied().unwrap_or(0);
+                let collider = collider & 0x0F;
+                if collider != 0 {
+                    self.collider_offsets.push((x, y, collider));
+                    occupied = true;
+                }
+
+                let interactor = self.interactors.get(i).copied().unwrap_or(0);
+                let interactor = interactor & 0x0F;
+                if interactor != 0 {
+                    self.interactor_offsets.push((x, y, interactor));
                     occupied = true;
                 }
 
@@ -246,6 +269,7 @@ impl Structure {
             && self.foreground_updates.is_empty()
             && self.overlay_updates.is_empty()
             && self.collider_offsets.is_empty()
+            && self.interactor_offsets.is_empty()
     }
 }
 
@@ -253,9 +277,20 @@ impl Structure {
 pub struct StructureDef {
     pub id: String,
     pub structure: Structure,
+    pub on_interact: Vec<String>,
+    pub interact_range: f32,
     pub frequency: f32,
     pub max_per_map: usize,
     pub min_distance: f32,
+}
+
+#[derive(Clone)]
+pub struct StructureInteractor {
+    pub structure_id: String,
+    pub rect: Rect,
+    pub group_rect: Rect,
+    pub on_interact: Vec<String>,
+    pub interact_range_world: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -362,8 +397,10 @@ impl StructureApplyState {
             let i = self.attempt_index;
             self.attempt_index += 1;
 
-            let rx = hash_u32(i as u32, self.seed ^ (self.def_index as u32 * 2654435761), 31);
-            let ry = hash_u32(i as u32, self.seed ^ (self.def_index as u32 * 2246822519), 47);
+            let def_seed = (self.def_index as u32).wrapping_mul(2654435761);
+            let def_seed_y = (self.def_index as u32).wrapping_mul(2246822519);
+            let rx = hash_u32(i as u32, self.seed ^ def_seed, 31);
+            let ry = hash_u32(i as u32, self.seed ^ def_seed_y, 47);
             let x = (rx as usize % (self.max_x + 1)).min(self.max_x);
             let y = (ry as usize % (self.max_y + 1)).min(self.max_y);
 
@@ -408,6 +445,7 @@ impl StructureApplyState {
             }
 
             map.place_structure_unchecked(&def.structure, x, y);
+            map.register_structure_interactors(def, x, y);
             for &(sx, sy) in def.structure.occupied_offsets.iter() {
                 let idx = map.idx(x + sx, y + sy);
                 self.occupied[idx] = true;
@@ -475,6 +513,7 @@ pub struct TileMap {
     foreground: Vec<u8>,
     overlay: Vec<u8>,
     solid: Vec<bool>,
+    collision_mask: Vec<u8>,
     collision_blocks: Vec<Rect>,
     collision_dirty: bool,
     chunk_cols: usize,
@@ -490,6 +529,7 @@ pub struct TileMap {
     chunk_allocs_this_frame: usize,
     chunk_rebuilds_this_frame: usize,
     structure_apply: Option<StructureApplyState>,
+    structure_interactors: Vec<StructureInteractor>,
     grid_size: Vec2,
     border_thickness: f32,
 }
@@ -542,6 +582,7 @@ impl TileMap {
             foreground: vec![EMPTY_TILE; len],
             overlay: vec![EMPTY_TILE; len],
             solid: vec![false; len],
+            collision_mask: vec![0; len],
             collision_blocks: Vec::new(),
             collision_dirty: true,
             chunk_cols,
@@ -557,6 +598,7 @@ impl TileMap {
             chunk_allocs_this_frame: 0,
             chunk_rebuilds_this_frame: 0,
             structure_apply: None,
+            structure_interactors: Vec::new(),
             grid_size,
             border_thickness,
         }
@@ -582,6 +624,7 @@ impl TileMap {
             foreground: vec![EMPTY_TILE; len],
             overlay: vec![EMPTY_TILE; len],
             solid: vec![false; len],
+            collision_mask: vec![0; len],
             collision_blocks: Vec::new(),
             collision_dirty: true,
             chunk_cols,
@@ -597,6 +640,7 @@ impl TileMap {
             chunk_allocs_this_frame: 0,
             chunk_rebuilds_this_frame: 0,
             structure_apply: None,
+            structure_interactors: Vec::new(),
             grid_size,
             border_thickness,
         }
@@ -653,6 +697,7 @@ impl TileMap {
     }
 
     pub fn start_structure_apply(&mut self, defs: Vec<StructureDef>, seed: u32) {
+        self.structure_interactors.clear();
         self.structure_apply = Some(StructureApplyState::new(self, defs, seed));
     }
 
@@ -672,6 +717,10 @@ impl TileMap {
             .as_ref()
             .map(|state| state.progress())
             .unwrap_or(1.0)
+    }
+
+    pub fn structure_interactors(&self) -> &[StructureInteractor] {
+        &self.structure_interactors
     }
 
     pub fn get_border_hitbox(&self) -> Rect {
@@ -792,15 +841,17 @@ impl TileMap {
                 ov_changed = true;
             }
         }
-        for &(sx, sy) in structure.collider_offsets.iter() {
+        for &(sx, sy, mask) in structure.collider_offsets.iter() {
             let tx = x + sx;
             let ty = y + sy;
             if tx >= max_x || ty >= max_y {
                 continue;
             }
             let idx = self.idx(tx, ty);
-            if !self.solid[idx] {
-                self.solid[idx] = true;
+            let next_mask = mask & 0x0F;
+            if self.collision_mask[idx] != next_mask {
+                self.collision_mask[idx] = next_mask;
+                self.solid[idx] = next_mask != 0;
                 collision_changed = true;
             }
         }
@@ -849,10 +900,12 @@ impl TileMap {
                 ov_changed = true;
             }
         }
-        for &(sx, sy) in structure.collider_offsets.iter() {
+        for &(sx, sy, mask) in structure.collider_offsets.iter() {
             let idx = self.idx(x + sx, y + sy);
-            if !self.solid[idx] {
-                self.solid[idx] = true;
+            let next_mask = mask & 0x0F;
+            if self.collision_mask[idx] != next_mask {
+                self.collision_mask[idx] = next_mask;
+                self.solid[idx] = next_mask != 0;
                 collision_changed = true;
             }
         }
@@ -873,6 +926,7 @@ impl TileMap {
     }
 
     pub fn apply_structures(&mut self, defs: &[StructureDef], seed: u32) {
+        self.structure_interactors.clear();
         let mut occupied = vec![false; self.width * self.height];
         let mut placed_rects: Vec<Rect> = Vec::new();
 
@@ -911,8 +965,10 @@ impl TileMap {
                 if count >= target {
                     break;
                 }
-                let rx = hash_u32(i as u32, seed ^ (def_index as u32 * 2654435761), 31);
-                let ry = hash_u32(i as u32, seed ^ (def_index as u32 * 2246822519), 47);
+                let def_seed = (def_index as u32).wrapping_mul(2654435761);
+                let def_seed_y = (def_index as u32).wrapping_mul(2246822519);
+                let rx = hash_u32(i as u32, seed ^ def_seed, 31);
+                let ry = hash_u32(i as u32, seed ^ def_seed_y, 47);
                 let x = (rx as usize % (max_x + 1)).min(max_x);
                 let y = (ry as usize % (max_y + 1)).min(max_y);
 
@@ -951,6 +1007,7 @@ impl TileMap {
                 }
 
                 self.place_structure_unchecked(&def.structure, x, y);
+                self.register_structure_interactors(def, x, y);
                 for &(sx, sy) in def.structure.occupied_offsets.iter() {
                     let idx = self.idx(x + sx, y + sy);
                     occupied[idx] = true;
@@ -961,6 +1018,53 @@ impl TileMap {
                 spatial_insert(rect_index, &padded, &mut spatial, cell_size, cell_cols, cell_rows);
                 count += 1;
             }
+        }
+    }
+
+    fn register_structure_interactors(&mut self, def: &StructureDef, x: usize, y: usize) {
+        if def.structure.interactor_offsets.is_empty() || def.on_interact.is_empty() {
+            return;
+        }
+        let tile_size = self.tile_size;
+        let mut rects: Vec<Rect> = Vec::new();
+        for &(sx, sy, mask) in def.structure.interactor_offsets.iter() {
+            let tile_x = (x + sx) as f32 * tile_size;
+            let tile_y = (y + sy) as f32 * tile_size;
+            let half_w = tile_size * 0.5;
+            let half_h = tile_size * 0.5;
+
+            if (mask & 0b0001) != 0 {
+                rects.push(Rect::new(tile_x, tile_y, half_w, half_h));
+            }
+            if (mask & 0b0010) != 0 {
+                rects.push(Rect::new(tile_x + half_w, tile_y, half_w, half_h));
+            }
+            if (mask & 0b0100) != 0 {
+                rects.push(Rect::new(tile_x, tile_y + half_h, half_w, half_h));
+            }
+            if (mask & 0b1000) != 0 {
+                rects.push(Rect::new(tile_x + half_w, tile_y + half_h, half_w, half_h));
+            }
+        }
+
+        if rects.is_empty() {
+            return;
+        }
+        let interact_range_world = def.interact_range * tile_size;
+
+        let mut group = rects[0];
+        for rect in rects.iter().skip(1) {
+            group = merge_rect(group, *rect);
+        }
+
+        for rect in rects {
+            self.structure_interactors.push(StructureInteractor {
+                structure_id: def.id.clone(),
+                rect,
+                group_rect: group,
+                on_interact: def.on_interact.clone(),
+                interact_range_world,
+            });
         }
     }
 
@@ -1018,14 +1122,17 @@ impl TileMap {
             return;
         }
         let i = self.idx(x, y);
-        if self.solid[i] != solid {
+        let next_mask = if solid { 0x0F } else { 0 };
+        if self.solid[i] != solid || self.collision_mask[i] != next_mask {
             self.solid[i] = solid;
+            self.collision_mask[i] = next_mask;
             self.collision_dirty = true;
         }
     }
 
     pub fn fill_collision(&mut self, solid: bool) {
         self.solid.fill(solid);
+        self.collision_mask.fill(if solid { 0x0F } else { 0 });
         self.collision_dirty = true;
     }
 
@@ -1058,6 +1165,7 @@ impl TileMap {
                     && lookup[tile as usize];
                 let idx = self.idx(x, y);
                 self.solid[idx] = solid;
+                self.collision_mask[idx] = if solid { 0x0F } else { 0 };
             }
         }
 
@@ -1379,8 +1487,28 @@ impl TileMap {
                 if ux >= self.width || uy >= self.height {
                     continue;
                 }
-                if self.solid[self.idx(ux, uy)] {
-                    out.push(self.tile_bounds(ux, uy));
+                let mask = self.collision_mask[self.idx(ux, uy)] & 0x0F;
+                if mask == 0 {
+                    continue;
+                }
+                let tile = self.tile_bounds(ux, uy);
+                if mask == 0x0F {
+                    out.push(tile);
+                    continue;
+                }
+                let half_w = tile.w * 0.5;
+                let half_h = tile.h * 0.5;
+                if (mask & 0b0001) != 0 {
+                    out.push(Rect::new(tile.x, tile.y, half_w, half_h));
+                }
+                if (mask & 0b0010) != 0 {
+                    out.push(Rect::new(tile.x + half_w, tile.y, half_w, half_h));
+                }
+                if (mask & 0b0100) != 0 {
+                    out.push(Rect::new(tile.x, tile.y + half_h, half_w, half_h));
+                }
+                if (mask & 0b1000) != 0 {
+                    out.push(Rect::new(tile.x + half_w, tile.y + half_h, half_w, half_h));
                 }
             }
         }
@@ -1592,12 +1720,20 @@ fn hash_u32(x: u32, y: u32, seed: u32) -> u32 {
     v
 }
 
+fn merge_rect(a: Rect, b: Rect) -> Rect {
+    let min_x = a.x.min(b.x);
+    let min_y = a.y.min(b.y);
+    let max_x = (a.x + a.w).max(b.x + b.w);
+    let max_y = (a.y + a.h).max(b.y + b.h);
+    Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
+}
+
 pub async fn load_structures_from_dir(dir: impl AsRef<Path>) -> Result<Vec<StructureDef>, std::io::Error> {
     let mut defs = Vec::new();
 
     if cfg!(target_arch = "wasm32") {
         let dir = data_path(&dir.as_ref().to_string_lossy());
-        let files = ["tree_plains.json", "bush_plains.json"];
+        let files = load_wasm_manifest_files(&dir, &["tree_plains.json", "bush_plains.json"]).await;
         for file in files {
             let path = format!("{}/{}", dir, file);
             let raw_str = load_string(&path)
@@ -1606,10 +1742,8 @@ pub async fn load_structures_from_dir(dir: impl AsRef<Path>) -> Result<Vec<Struc
             let raw: StructureFile = serde_json::from_str(&raw_str)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             let tile_len = raw.width * raw.height;
-            let mut colliders = raw.colliders.unwrap_or_default();
-            if colliders.len() != tile_len {
-                colliders = vec![false; tile_len];
-            }
+            let colliders = normalized_collider_pins(raw.colliders, tile_len);
+            let interactors = normalized_collider_pins(raw.interactors, tile_len);
             let structure = Structure::new(
                 raw.width,
                 raw.height,
@@ -1617,11 +1751,14 @@ pub async fn load_structures_from_dir(dir: impl AsRef<Path>) -> Result<Vec<Struc
                 raw.foreground,
                 raw.overlay,
                 colliders,
+                interactors,
             );
 
             defs.push(StructureDef {
                 id: raw.id,
                 structure,
+                on_interact: raw.on_interact.unwrap_or_default(),
+                interact_range: raw.interact_range.unwrap_or(0.0).max(0.0),
                 frequency: raw.frequency.unwrap_or(0.05),
                 max_per_map: raw.max_per_map.unwrap_or(10),
                 min_distance: raw.min_distance.unwrap_or(64.0),
@@ -1641,13 +1778,14 @@ pub async fn load_structures_from_dir(dir: impl AsRef<Path>) -> Result<Vec<Struc
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
+        if path.file_name().and_then(|n| n.to_str()) == Some("index.json") {
+            continue;
+        }
         let raw: StructureFile = serde_json::from_str(&std::fs::read_to_string(&path)?)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let tile_len = raw.width * raw.height;
-        let mut colliders = raw.colliders.unwrap_or_default();
-        if colliders.len() != tile_len {
-            colliders = vec![false; tile_len];
-        }
+        let colliders = normalized_collider_pins(raw.colliders, tile_len);
+        let interactors = normalized_collider_pins(raw.interactors, tile_len);
         let structure = Structure::new(
             raw.width,
             raw.height,
@@ -1655,11 +1793,14 @@ pub async fn load_structures_from_dir(dir: impl AsRef<Path>) -> Result<Vec<Struc
             raw.foreground,
             raw.overlay,
             colliders,
+            interactors,
         );
 
         defs.push(StructureDef {
             id: raw.id,
             structure,
+            on_interact: raw.on_interact.unwrap_or_default(),
+            interact_range: raw.interact_range.unwrap_or(0.0).max(0.0),
             frequency: raw.frequency.unwrap_or(0.05),
             max_per_map: raw.max_per_map.unwrap_or(10),
             min_distance: raw.min_distance.unwrap_or(64.0),
@@ -1680,11 +1821,40 @@ struct StructureFile {
     #[serde(default)]
     overlay: Vec<u8>,
     #[serde(default)]
-    colliders: Option<Vec<bool>>,
+    colliders: Option<ColliderPinsFile>,
+    #[serde(default)]
+    interactors: Option<ColliderPinsFile>,
+    #[serde(default)]
+    on_interact: Option<Vec<String>>,
+    #[serde(default)]
+    interact_range: Option<f32>,
     #[serde(default)]
     frequency: Option<f32>,
     #[serde(default)]
     max_per_map: Option<usize>,
     #[serde(default)]
     min_distance: Option<f32>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ColliderPinsFile {
+    Bool(Vec<bool>),
+    Pins(Vec<u8>),
+}
+
+fn normalized_collider_pins(raw: Option<ColliderPinsFile>, tile_len: usize) -> Vec<u8> {
+    let mut out = match raw {
+        Some(ColliderPinsFile::Pins(v)) => v.into_iter().map(|m| m & 0x0F).collect(),
+        Some(ColliderPinsFile::Bool(v)) => v
+            .into_iter()
+            .map(|solid| if solid { 0x0F } else { 0 })
+            .collect(),
+        None => Vec::new(),
+    };
+
+    if out.len() != tile_len {
+        out = vec![0; tile_len];
+    }
+    out
 }
